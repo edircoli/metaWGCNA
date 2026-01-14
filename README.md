@@ -13,6 +13,7 @@ This repository contains the analysis pipeline, data, and source code for the "m
 
 ## Repository structure
 
+```text
 metaWGCNA/
 ├── analysis.Rmd 
 ├── data/
@@ -29,3 +30,4 @@ metaWGCNA/
 │   ├── illustrations/
 │   └── results/    
 └── README.md
+```
