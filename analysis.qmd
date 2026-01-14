@@ -1,0 +1,729 @@
+---
+title: "analysis"
+format: html
+---
+
+# FullMetaWGCNA: A framework for correlating metatranscriptomics with metagenomics at the module level
+
+Overview:
+
+-   An analysis using WGCNA of the most relevant modules from the top taxonomic groups metatranscriptomics counts, including its correlation with OMP degradation rates (kbios).
+
+-   An analysis using WGCNA of the taxonomic abundance from the metagenomics counts, including its correlation with OMP degradation rates (kbios).
+
+-   A correlation between the eigengenes from both modules to check if there is a direct correlation between transcripts and taxonomic abundance (Pearson correlation).
+
+-   Enrichment analysis for modules with high correlation among OMP degradation and cross-omics.
+
+## Preliminaries
+
+### Required packages installation
+
+```{r}
+install.packages("BiocManager")
+library(BiocManager)
+BiocManager::install("WGCNA")
+BiocManager::install("flashClust")
+```
+
+### Loading libraries
+
+```{r}
+library(reticulate)
+library(flashClust)
+library(curl)
+library(tidyverse)
+library(DESeq2)
+library(edgeR)
+library(WGCNA)
+library(dplyr)
+library(tidyr)
+library(mixOmics)
+library(Hmisc)
+library(pheatmap)
+library(clusterProfiler)
+library(purrr)
+library(broom)
+library(ggplot2)
+library(RColorBrewer)
+library(scales)
+```
+
+## Data preprocessing
+
+### Data loading
+
+To start the analysis the following files will be loaded:
+
+-   `clusters.tsv`: file containing the organism from which each gene come from.
+
+-   `2024-10-01_spades_transcript_counts.csv`: contains raw total counts of all the genes in each sample.
+
+-   `coverm_drep-relative_abundance.tsv`: taxonomic relative abundance for every organism found in each sample.
+
+-   `nitrosomonas_kbios.csv`: kbios measured in each sample for all OMPs to be analysed.
+
+-   `gtdbtk.bac120.summary.tsv`:
+
+-   `out.bin.all.emapper.annotations`:
+
+```{r}
+# Define paths relative to the project root
+path_clusters <- "data/metadata/clusters.tsv"
+path_counts   <- "data/raw_counts/2024-10-01_spades_transcript_counts.csv"
+path_ref      <- "data/metadata/coverm_drep-relative_abundances.tsv"
+kbios_path    <- "data/metadata/nitrosomonas_kbios.csv"
+
+# Enrichment paths
+taxa_enrichment_path <- "data/enrichment/gtdbtk.bac120.summary.tsv"
+txn_enrichment_path  <- "data/enrichment/out.bin.all.emapper.annotations"
+
+# Load Data
+clusters <- read.csv(path_clusters, sep="\t", header=FALSE)
+colnames(clusters) <- c("Cluster","Gene")
+
+counts <- read.csv(path_counts, header=TRUE, check.names=FALSE)
+rownames(counts) <- counts[[1]]
+counts <- counts[, -1]
+
+taxa <- read.csv(path_ref, sep="\t")
+rownames(taxa) <- taxa[[1]]
+taxa <- taxa[, c(-1, -6)]
+
+kbios = read.csv(kbios_path)
+
+kbios_pivot <- kbios |>
+  dplyr::select(-low.Kbio, -high.Kbio, -R2) |>
+  pivot_wider(names_from = OMP, values_from = Kbio, values_fill = list(Kbio = 0)) |>
+  mutate(sample = paste0("('", condition, "'-'", reactor, "')")) |>
+  column_to_rownames(var = "sample") |>
+  dplyr::select(-condition, -reactor)
+```
+
+## Normalization
+
+### Transcripts - Transforming to normalized counts (CPM)
+
+Count per million (cpm) is used to normalized the raw counts. Genes under 10 counts were also filtered out from the matrix.
+
+```{r}
+# Getting rid of every gene under 10 counts across all samples
+count_total <- rowSums(counts)
+over_counts <- count_total >= 10
+filtered_counts <- counts[over_counts, ]
+
+# CPM transformation - gene count
+log_cpm_counts <- as.data.frame(cpm(as.matrix(filtered_counts), log=TRUE))
+# Transposing table for WGCNA - gene count
+norm_data <- as.data.frame(t(log_cpm_counts))
+
+# Aligning kbios dataframe
+kbios_pivot <- kbios_pivot[rownames(norm_data), , drop = FALSE]
+```
+
+### Clusters abundance - Transforming to normalized counts (CLR)
+
+Taxonomic clusters abundances were normalized using center-log ratio (CLR) transform. Total biomass is also included into the normalization step.
+
+```{r}
+# Getting rid of every taxa cluster under 0.5% across all samples
+taxa_total <- rowSums(taxa)
+over_taxa <- taxa_total >= 0.5
+filtered_taxa <- taxa[over_taxa, ]
+
+# Multiplying taxa counts with biomass (VSS) 
+vss <- c(0.72, 0.9, 0.88, 0.71)
+filtered_taxa_vss <- sweep(filtered_taxa, 2, vss, "*")
+
+# CLR transformation - taxa count
+clr_taxa <- apply(filtered_taxa_vss + 1e-6, 2, function(x){
+  logx <- log(x)
+  logx - mean(logx)
+})
+
+# Transposing table for WGCNA - gene count
+norm_taxa <- as.data.frame(t(clr_taxa))
+
+# Extracting community number from count data
+sample_name <- rownames(norm_data)
+taxa_idx <- as.integer(sub("^.*?([0-9]+)'\\)$", "\\1", sample_name))
+
+# Subseting norm_taxa by these rows
+norm_taxa <- norm_taxa[taxa_idx, , drop = FALSE]
+rownames(norm_taxa) <- sample_name
+```
+
+## Sorting
+
+### Getting transcripts sorted by taxonomic abundance
+
+```{r}
+# Get mean normalized abundace per taxa
+mean_taxa <- colMeans(norm_taxa, na.rm = TRUE)
+
+# Get top taxonomic groups sorted in descending order
+top <- names(sort(mean_taxa, decreasing = TRUE))
+
+# Get transcripts from top taxonomic groups (sanity check)
+top_genes <- clusters |>
+  filter(Cluster %in% top) |>
+  pull(Gene)
+
+# Get compatible transcripts names from normalized count data
+gene_names <- sub("_[0-9]+$", "", colnames(norm_data))
+lookup <- setNames(colnames(norm_data), gene_names)
+
+# Look for transcripts that are present in count data
+inter_genes <- intersect(gene_names, top_genes)
+selected_genes <- lookup[inter_genes]
+
+# Extract top taxonomic group trasncripts (sanity check)
+norm_data_top <- norm_data |>
+  dplyr::select(all_of(unique(selected_genes)))
+```
+
+## Single-omics analysis
+
+### WGCNA in metatranscriptomics data
+
+To begin with the analysis transcript modules were computed using WGCNA on the metatranscriptomics normalized data.
+
+```{r}
+sampleTree <- hclust(dist(norm_data_top), method = "average")
+par(cex = 0.6, mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering", cex.text = 0.8)
+### GENE CO-EXPRESSION NETWORK CONSTRUCTION ### 
+
+# Select power threshold
+spt <- pickSoftThreshold(norm_data_top, powerVector = seq(1, 20, by = 1))
+set <- spt$powerEstimate  # or choose based on diagnostic plots
+
+# Adejency matrix construction
+adjacency <- adjacency(norm_data_top, power = set)
+
+### GENE MODULES DETECTION ###
+
+# TOM-based dissimilarity measure
+TOM <- TOMsimilarity(adjacency)
+TOM_dissimilarity <- 1 - TOM
+
+# Gene clustering on TOM-based dissimilarity
+geneTree <- hclust(as.dist(TOM_dissimilarity), method = "average")
+
+modules <- cutreeDynamic(dendro = geneTree, distM = TOM_dissimilarity,
+                         deepSplit = 2, pamRespectsDendro = FALSE, 
+                         minClusterSize = 30, cutHeight = 0.99)
+
+module_colors <- labels2colors(modules)
+
+plotDendroAndColors(geneTree, module_colors, "Module",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Gene dendrogram with colored modules")
+
+### GENE MODULES RELATIONSHIPS ###
+
+# Calculate module eigengenes
+MElist <- moduleEigengenes(norm_data_top, colors = module_colors) 
+MEs <- MElist$eigengenes
+
+# Module merging based on eigengene similarity
+ME_dissimilarity <- 1 - cor(MEs, use = "complete")
+ME_threshold <- 0.9
+METree <- hclust(as.dist(ME_dissimilarity), method = "average")
+
+merge <- mergeCloseModules(norm_data_top, module_colors, cutHeight = 1 - ME_threshold)
+mergedMEs <- merge$newMEs
+
+# Compute p-values between correlation modules
+corMat <- cor(mergedMEs, use = "pairwise.complete.obs")
+nSamples <- nrow(mergedMEs)
+pMat    <- WGCNA::corPvalueStudent(corMat, nSamples)
+pvCols <- colorRampPalette(c("navy", "white"))(50)
+
+# Visualize modules correlation
+par(cex = ME_threshold) 
+plotEigengeneNetworks(mergedMEs, "", marDendro = c(0,4,1,2), marHeatmap = c(5,4,1,2), cex.lab = 0.8, xLabelsAngle = 90, plotAdjacency = FALSE)
+
+# Visualize p-values of each correlation
+heatCols <- colorRampPalette(c("blue", "white", "red"))(50)
+labeledHeatmap(
+  Matrix          = corMat,
+  xLabels         = colnames(mergedMEs),
+  yLabels         = colnames(mergedMEs),
+  colorLabels     = FALSE,
+  colors          = heatCols,
+  zlim            = c(-1, 1),
+  textMatrix      = signif(pMat, 2),  # <- show p-values as text
+  cex.text        = 0.6,              # text size
+  setStdMargins   = FALSE,
+  main            = "Module Eigengene Correlations\n(p-values in cells)"
+)
+```
+
+### Case study: Atenolol and mycophenolic acid degradation
+
+Focusing on two OMPs for more easy visualization, there are 4 identified modules with high correlation on the degradation of Atenolol and mycophenolic acid: `MEmidnightblue`, `MEyellow`, `MEsienna3` and `MEdarkgrey`. This modules also correlate with other ones apart from these, suggesting an inter-modular mechanism in the degradation of these OMPs.
+
+```{r}
+# Define selected vs. other MEs
+selected <- c("MEmidnightblue", "MEyellow", "MEsienna3", "MEdarkgrey")
+others   <- setdiff(colnames(mergedMEs), selected)
+nSamples <- nrow(mergedMEs)
+
+# Compute rectangular correlation matrix
+subCorMat <- cor(mergedMEs[, others], mergedMEs[, selected],
+                 use = "pairwise.complete.obs")
+
+# Compute p-values pairwise
+pMat <- matrix(NA,
+               nrow = length(others),
+               ncol = length(selected),
+               dimnames = list(others, selected))
+for(i in seq_along(others)) {
+  for(j in seq_along(selected)) {
+    pMat[i,j] <- WGCNA::corPvalueStudent(subCorMat[i,j], nSamples)
+  }
+}
+
+# Build a text matrix of “cor (p)” strings
+textMat <- matrix(
+  sprintf("%.2f (%.3f)", subCorMat, pMat),
+  nrow = nrow(subCorMat),
+  dimnames = dimnames(subCorMat)
+)
+
+# Plot
+heatCols <- colorRampPalette(c("blue", "white", "red"))(50)
+labeledHeatmap(
+  Matrix        = subCorMat,      # colors based on correlation
+  xLabels       = selected,
+  yLabels       = others,
+  colorLabels   = FALSE,
+  colors        = heatCols,
+  textMatrix    = textMat,        # show cor (p) in each cell
+  cex.text      = 0.6,
+  setStdMargins = FALSE,
+  zlim          = c(-1, 1),
+  main          = "Module Eigengene Correlations\n(correlation (p-value))"
+)
+```
+
+An intra-modular analysis can be performed in these modules to analyse the taxonomic composition of each one.
+
+```{r}
+# -----PREPROCESSING-----
+
+# Step 1: Keep original Gene column and create a cleaned version for merging
+geneModuleDf <- data.frame(
+  Gene   = colnames(norm_data_top),
+  Module = module_colors,
+  stringsAsFactors = FALSE
+)
+
+# Create a new column for the cleaned gene name (used for matching only)
+geneModuleDf$Gene_clean <- sub("_[0-9]{1,2}$", "", geneModuleDf$Gene)
+
+# Step 2: Also prepare the clusters table with a matching cleaned gene column
+clusters$Gene_clean <- sub("_[0-9]{1,2}$", "", clusters$Gene)
+
+# Step 3: Merge using the cleaned columns, but retain the full Gene names
+selected <- c("midnightblue","yellow","sienna3","darkgrey")
+
+df_mod <- geneModuleDf %>%
+  filter(Module %in% selected) %>%
+  inner_join(clusters, by = "Gene_clean", suffix = c("_mod", "_clust"))
+
+# Now you have:
+# - `Gene_mod`: original transcript name from geneModuleDf (with number)
+# - `Gene_clust`: original transcript name from clusters (with number)
+# - `Gene_clean`: shared cleaned gene ID used to match
+# - `Module` and `Cluster` as needed
+
+# Step 4: Count genes per (Module × Cluster)
+counts <- df_mod %>%
+  dplyr::count(Module, Cluster, name = "GeneCount")
+
+# Step 5: Pivot wide for overview
+counts_wide <- counts %>%
+  tidyr::pivot_wider(
+    names_from = Module,
+    values_from = GeneCount,
+    values_fill = 0
+  )
+
+# Step 6: Shared clusters in >1 module
+shared_groups <- counts %>%
+  group_by(Cluster) %>%
+  dplyr::summarize(NumModules = n_distinct(Module)) %>%
+  filter(NumModules > 1) %>%
+  pull(Cluster)
+
+# -----PLOTTING-----
+
+# 1. Pivot wide → long
+counts_long <- counts_wide %>%
+  pivot_longer(
+    cols      = -Cluster,
+    names_to  = "Module",
+    values_to = "GeneCount"
+  )
+
+# 2. Compute relative abundances
+counts_rel <- counts_long %>%
+  group_by(Module) %>%
+  mutate(RelAbundance = GeneCount / sum(GeneCount)) %>%
+  ungroup()
+
+# 3. Enforce module order
+module_order <- c("midnightblue","yellow","sienna3","darkgrey")
+counts_rel$Module <- factor(counts_rel$Module, levels = module_order)
+
+# 4. Identify “major” clusters (≥1% in at least one module)
+major_clusters <- counts_rel %>%
+  group_by(Cluster) %>%
+  dplyr::summarize(MaxAb = max(RelAbundance), .groups = "drop") %>%
+  dplyr::filter(MaxAb >= 0.02) %>%
+  pull(Cluster)
+
+# 5. Recode minor clusters as “Other”
+counts_rel_collapsed <- counts_rel %>%
+  mutate(Cluster2 = if_else(Cluster %in% major_clusters, Cluster, "Other"))
+
+# 6. Sum up so that “Other” is one bar segment
+counts_plot <- counts_rel_collapsed %>%
+  group_by(Module, Cluster2) %>%
+  dplyr::summarize(RelAbundance = sum(RelAbundance), .groups = "drop")
+
+# 7. Build fill palette: distinct for majors + gray for Other
+n_maj <- length(major_clusters)
+pal_maj <- if (n_maj <= 12) {
+  brewer.pal(n_maj, "Set3")
+} else {
+  colorRampPalette(brewer.pal(12, "Set3"))(n_maj)
+}
+fill_colors <- c(
+  setNames(pal_maj, major_clusters),
+  Other = "grey70"
+)
+
+# 8. Plot
+ggplot(counts_plot, aes(x = Module, y = RelAbundance, fill = Cluster2)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  scale_fill_manual(values = fill_colors, breaks = c(major_clusters, "Other")) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    x     = "Module",
+    y     = "Relative Abundance",
+    fill  = "Taxonomic Group",
+    title = "Taxonomic Composition (majors + Other <2%)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    panel.grid   = element_blank()
+  )
+
+ggplot(counts_plot, aes(x = RelAbundance, y = Module, fill = Cluster2)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  scale_fill_manual(values = fill_colors, breaks = c(major_clusters, "Other")) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    x     = "Relative Abundance",
+    y     = "Module",
+    fill  = "Taxonomic Group",
+    title = "Taxonomic Composition (majors + Other <2%)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y  = element_text(hjust = 1),
+    panel.grid   = element_blank()
+  )
+```
+
+Relevant taxa from figure:
+
+-   `S1C1381`: *Giesbergeria suum*
+
+-   `S3C478`: *Lautropia sp.*
+
+-   `S2C1424`: *Nitrosomonas mobilis*
+
+-   `S1C1150`: *Nitrosomonas europea*
+
+-   `S2C331`: *Pseudoxanthomonas A Mexicana*
+
+## Multi-omics integration
+
+WGCNA modules eigengenes have the potential to be correlated across other modules through different omics. The idea is to correlate modules from metatranscriptomics data into taxonomic abundance modules that could infer a correlation between the two data types (i.e. which group of transcripts are dependent on which group of taxa?).
+
+### WGCNA in taxonomic abundance data
+
+To start the multi-omics analysis WGCNA was computed on the taxonomic cluster abundance data.
+
+```{r}
+### TAXA CO-ABUNDANCE NETWORK CONSTRUCTION ### 
+
+# Select power threshold
+spt <- pickSoftThreshold(norm_taxa, powerVector = seq(1, 20, by = 1))
+set <- spt$powerEstimate  # or choose based on diagnostic plots
+set <- 6 # because spt$powerEstimate returns NA
+
+# Adejency matrix construction
+taxa_adjacency <- adjacency(norm_taxa, power = set)
+
+### TAXA MODULES DETECTION ###
+
+# TOM-based dissimilarity measure
+taxa_TOM <- TOMsimilarity(taxa_adjacency)
+taxa_TOM_dissimilarity <- 1 - taxa_TOM
+
+# Taxa clustering on TOM-based dissimilarity
+taxa_Tree <- hclust(as.dist(taxa_TOM_dissimilarity), method = "average")
+
+taxa_modules <- cutreeDynamic(dendro = taxa_Tree, distM = taxa_TOM_dissimilarity,
+                         deepSplit = 2, pamRespectsDendro = FALSE, 
+                         minClusterSize = 10, cutHeight = 0.99)
+
+taxa_module_colors <- labels2colors(taxa_modules)
+
+### TAXA MODULES RELATIONSHIPS ###
+
+# Calculate module eigengenes
+taxa_MElist <- moduleEigengenes(norm_taxa, colors = taxa_module_colors) 
+taxa_MEs <- taxa_MElist$eigengenes
+
+# Module merging based on eigengene similarity
+taxa_ME_dissimilarity <- 1 - cor(taxa_MEs, use = "complete")
+taxa_ME_threshold <- 0.95
+taxa_METree <- hclust(as.dist(taxa_ME_dissimilarity), method = "average")
+
+taxa_merge <- mergeCloseModules(norm_taxa, taxa_module_colors, cutHeight = 1 - taxa_ME_threshold)
+taxa_mergedMEs <- taxa_merge$newMEs
+
+# Visualize modules correlation
+par(cex = taxa_ME_threshold) 
+plotEigengeneNetworks(taxa_mergedMEs, "", marDendro = c(0,4,1,2), marHeatmap = c(5,4,1,2), cex.lab = 0.8, xLabelsAngle = 90)
+```
+
+### Correlation of modules from taxa to transcripts
+
+Eigengenes can be directly linked across different omics. In this case, transcripts and taxa WGCNA modules are correlated by these.
+
+```{r}
+# mergedMEs: transcriptomics modules
+# taxa_mergedMEs: taxonomic modules
+
+# 1. Compute the correlation matrix between every transcripts and taxa modules
+cors <- cor(mergedMEs, taxa_mergedMEs, use = "pairwise.complete.obs")
+
+# 2. Compute p-values for each correlation
+rc <- rcorr(as.matrix(mergedMEs), as.matrix(taxa_mergedMEs), type = "pearson")
+pvals <- rc$P[rownames(cors), colnames(cors)]
+
+# 3. Visualize heatmap
+pheatmap(
+  cors,
+  display_numbers = signif(pvals, 2),
+  number_color = "black",
+  main = "Cross-omic Module Correlations\n(transcripts vs. taxonomic abundance)",
+  fontsize_number = 10,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE
+)
+```
+
+There is no conclusive evidence that transcripts are linked to taxonomic abundance in this case.
+
+## Gene set enrichment analysis
+
+From the modules of interest enrichment was performed with their KEGG annotations associated to each transcript. Sub-grouping based on species was perform in each module, so a total of clusters x modules enrichment analyses were performed.
+
+### Extract annotations
+
+```{r}
+library(data.table)
+
+# Reading information regarding taxnomic annotations
+taxa_annotations <- read.csv(taxa_enrichment_path, sep = "\t")
+
+# Working with emapper file output
+all.lines <- readLines(txn_enrichment_path, n=500)
+header.line <- grep("^#query", all.lines)[1]
+
+col.names <- strsplit(sub("^#", "", all.lines[header.line]), "\t")[[1]]
+
+emap <- fread(txn_enrichment_path,
+              skip = header.line,
+              sep = "\t",
+              header = FALSE,
+              col.names = col.names,
+              na.strings = c("", "-", "NA"))
+```
+
+### Mapping genome IDs -\> species
+
+```{r}
+found_taxa <- c("S1C1150", "S1C1229", "S1C1261", "S1C1381", "S1C1423", "S1C373", "S1C408", "S1C438", "S1C477", "S1C954", "S2C1375", "S2C1424", "S2C181", "S2C226", "S2C269", "S2C331", "S3C1177", "S3C1673", "S3C221", "S3C478", "S3C780", "S3C904", "S4C1079", "S4C740")
+
+taxa_annotations |> 
+  select(c(user_genome, classification)) |>
+  filter(user_genome %in% found_taxa) |>
+  mutate(family = sub(".*f__", "", classification)) |>
+  select(-classification)
+```
+
+### Extract KEGG pathway IDs that exist on transcript data
+
+```{r}
+# 1) extract genes that are on emapper
+top_taxa_genes <- colnames(norm_data_top)
+common_genes <- intersect(top_taxa_genes, emap$query)
+missing_genes <- setdiff(top_taxa_genes, emap$query)
+
+cat("Of", length(top_taxa_genes), "genes,", length(common_genes), "are found in emapper annotations.\n")
+
+# 2) assign corresponding modules to genes on emapper
+emmaper_mod <- merge$colors[top_taxa_genes %in% common_genes]
+common_genes_mod <- tibble(common_genes, emmaper_mod)
+common_genes_mod <- common_genes_mod |>
+  rename(geneID = common_genes, module = emmaper_mod)
+
+# 3) pull out all KEGG-pathway mapping
+kegg_map <- emap %>%
+  dplyr::select(query, KEGG_Pathway) %>%
+  filter(!is.na(KEGG_Pathway) & KEGG_Pathway != "") %>%
+  separate_rows(KEGG_Pathway, sep = ",") %>%
+  rename(geneID = query, pathwayID = KEGG_Pathway) %>%
+  distinct()
+
+# 4) assign KEGG-pathway to each gene that exist in the transcripts
+term2gene_kegg <- kegg_map |>
+  inner_join(common_genes_mod, by = join_by(geneID))
+```
+
+### Merging KEGG pathways to modules dataframe
+
+```{r}
+df_mod_annot <- df_mod |>
+  left_join(emap,
+            by =c("Gene_mod" = "query"))
+
+df_mod_annot_expanded <- df_mod_annot |>
+  separate_rows(KEGG_Pathway, sep = ",")
+
+head(df_mod_annot_expanded)
+```
+
+### Enrichment analysis for every module of interset
+
+```{r}
+# 1) Merge df_mod_annot_expanded with term2gene table
+kegg_annot <- term2gene_kegg |>
+  inner_join(
+    df_mod_annot_expanded %>% select(Gene_mod, Module, Cluster) %>% distinct(),
+    by = c("geneID" = "Gene_mod")
+  )
+
+# 2) Define universe size N
+all_genes <- term2gene_kegg$geneID %>% unique()
+N <- length(all_genes)
+
+# 3) Precompute path2genes
+path2genes <- term2gene_kegg |>
+  group_by(pathwayID) |>
+  dplyr::summarize(
+    genes = list(unique(geneID)),
+    M = n_distinct(geneID),
+    .groups = "drop"
+  )
+
+# 4) Build a table of (Module, CLuster) -> gene list + K
+module_cluster_genes <- kegg_annot |>
+  group_by(Module, Cluster) |>
+  dplyr::summarize(
+    module_cluster_genes = list(unique(geneID)),
+    K = n_distinct(geneID),
+    .groups = "drop"
+  )
+
+# 5) For each (Module, Cluster) x each pathway, compute enrichment
+enrich_mc <- module_cluster_genes |>
+  crossing(path2genes) |>
+  rowwise() |>
+  mutate(
+    x = length(intersect(module_cluster_genes, genes)),  # overlap
+    p_value = phyper(
+      q = x - 1,
+      m = M,
+      n = N - M,
+      k = K,
+      lower.tail = FALSE
+    ),
+    enrich_ratio = (x / K) / (M / N)
+  ) |>
+  ungroup()
+
+# 6) Multiple-test correction
+enrich_mc <- enrich_mc |>
+  group_by(Module, Cluster) |>
+  mutate(p_adj = p.adjust(p_value, method = "BH")) |>
+  ungroup()
+
+# 7) Filter for significant hits 
+sig_enrich_mc <- enrich_mc |>
+  filter(x >= 2, p_adj < 0.05) |>
+  arrange(Module, Cluster, p_adj)
+
+# 8) Inspect
+sig_enrich_mc |>
+  dplyr::select(
+    Module,
+    Cluster,
+    pathwayID,
+    x,      # hits in this (module,cluster)
+    K,      # size of (module,cluster)
+    M,      # background size of pathway
+    enrich_ratio,
+    p_value,
+    p_adj
+  ) |>
+  print(n = Inf)
+```
+
+### Pathway description from IDs
+
+```{r}
+library(KEGGREST)
+
+# 1) Pull out the unique pathway IDs from your module×cluster enrichments
+unique_paths_mc <- unique(sig_enrich_mc$pathwayID)
+
+# 2) Query KEGGREST for each pathway’s human-readable name
+path_info_mc <- lapply(unique_paths_mc, function(pid) {
+  info <- keggGet(pid)[[1]]
+  data.frame(
+    pathwayID   = pid,
+    pathwayName = info$NAME,
+    stringsAsFactors = FALSE
+  )
+})
+
+# 3) Combine into a lookup table
+path_lookup_mc <- bind_rows(path_info_mc)
+
+# 4) Merge descriptive names back into the sig_enrich_mc table
+sig_enrich_mc_annot <- sig_enrich_mc %>%
+  left_join(path_lookup_mc, by = "pathwayID") %>%
+  dplyr::select(Module, Cluster, pathwayID, pathwayName,
+         x, K, M, enrich_ratio, p_value, p_adj) %>%
+  arrange(Module, Cluster, p_adj)
+
+# 5) Inspect your fully annotated results
+print(sig_enrich_mc_annot, n = Inf)
+
+# If you just want the vector of names:
+sig_enrich_mc_annot$pathwayName
+```
+
+It is important to point out that the Magenta module is correlated to the degradation of loperamide and ketoprofen, and 4 out of the 18 significant pathways found are metabolism of xenobiotics.
