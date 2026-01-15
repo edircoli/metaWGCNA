@@ -33,6 +33,12 @@ metaWGCNA/
 └── README.md
 ```
 
+## Authors and contributions
+- **[Edir Vidal](https://orcid.org/0000-0001-6218-6152)**: Methodology and software development (R), and bioinformatics analysis (gene-set enrichment analysis, cross-omics correlations, etc.).
+- **[Michaël Pierrelée](https://orcid.org/0009-0006-4521-0097)**: Data curation and normalization, guidance on the downstream analyses and statistical validation.
+- **[Alberto Santos Delgado](https://orcid.org/0000-0002-9163-7730)**: Conceptualization and guidance on the WGCNA methodology.
+- **[Borja Valverde Pérez](https://orcid.org/0000-0001-7255-1395)**: Conceptualization and main supervisor of the project.
+
 ## References
 
 [1] A. B. Rios-Miguel et al., "Predicting and improving the microbial removal of organic micropollutants during wastewater treatment: A review," *Chemosphere*, vol. 333, p. 138908, 2023.
